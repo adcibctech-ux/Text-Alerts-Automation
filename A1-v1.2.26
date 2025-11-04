@@ -1,0 +1,186 @@
+/***** Automation A1: Phone/Opt-in → Webhook (Base A: ADCIBC 2026) *****
+Inputs required (Automation → “Run script” → Input variables):
+  - recordId   (string) : trigger record ID from "When record updated"
+  - webhookUrl (string) : webhook URL from Base B automation
+***********************************************************************/
+
+const { recordId, webhookUrl } = input.config();
+const tableName = "Competitor Profiles";
+
+// ---- Field names (exact) ----
+const F = {
+  fullName: "Full Name",
+  phone: "Competitor Phone Number",
+  optIn: "Text Alerts OPT IN",
+  locations: "Regionals Locations",              // lookup → array of city names
+  lastPushedJson: "Last Pushed Cities (JSON)",   // long text
+  phoneStatus: "Phone Validation Status",        // single select
+  pushStatus: "Last Text Alerts Push Status",    // single line text
+  pushAt: "Last Text Alerts Push At"             // date/time
+};
+
+// ---- Canonical city list (must match TEXT ALERTS {City} options exactly) ----
+const CANONICAL_CITIES = [
+  "San Francisco, CA",
+  "Seattle, WA",
+  "Berlin [Germany]",
+  "Chicago, IL",
+  "Phoenix, AZ",
+  "Atlanta, GA",
+  "Toronto, ON [Canada]",
+  "Los Angeles, CA",
+  "San Diego, CA",
+  "Houston, TX",
+  "Pittsburgh, PA",
+  "Raleigh, NC",
+  "Dallas, TX",
+  "Denver, CO",
+  "Orlando, FL"
+];
+
+// Precompute for fast lookups
+const CANON_SET = new Set(CANONICAL_CITIES);
+const CANON_LOWER_MAP = new Map(CANONICAL_CITIES.map(c => [c.toLowerCase(), c]));
+
+function resolveCityToCanonical(incoming) {
+  if (!incoming) return null;
+  const incTrim = incoming.trim();
+  if (!incTrim) return null;
+
+  // (a) exact match
+  if (CANON_SET.has(incTrim)) return incTrim;
+
+  const incLower = incTrim.toLowerCase();
+
+  // (b) case-insensitive exact
+  if (CANON_LOWER_MAP.has(incLower)) return CANON_LOWER_MAP.get(incLower);
+
+  // (c) prefix-before-comma match e.g. "Seattle" -> "Seattle, WA"
+  //     Allow unique match where canonical starts with "incTrim,"
+  const prefixMatches = CANONICAL_CITIES.filter(c => c.toLowerCase().startsWith(incLower + ","));
+  if (prefixMatches.length === 1) return prefixMatches[0];
+
+  // (d) last-chance compare left-of-comma of canonicals
+  const leftMatches = CANONICAL_CITIES.filter(c => {
+    const left = c.split(",")[0].trim().toLowerCase();
+    return left === incLower;
+  });
+  if (leftMatches.length === 1) return leftMatches[0];
+
+  // unresolved or ambiguous
+  return null;
+}
+
+const PHONE_STATUS = {
+  VALID: "Valid (+1 US)",
+  EMPTY: "Invalid: empty",
+  NOT_US: "Invalid: not US",
+  BAD_LEN: "Invalid: bad length/format",
+};
+
+function digitsOnly(s) { return (s || "").replace(/\D+/g, ""); }
+
+function validateUSPhone(d) {
+  if (!d) return { ok: false, reason: PHONE_STATUS.EMPTY };
+  if (!/^\d+$/.test(d)) return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+  if (d.length === 10) return { ok: true, normalized: d };
+  if (d.length === 11 && d.startsWith("1")) return { ok: true, normalized: d };
+  if (d.length === 11 && !d.startsWith("1")) return { ok: false, reason: PHONE_STATUS.NOT_US };
+  return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+}
+
+function uniqueStrings(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+// ---- Main ----
+const table = base.getTable(tableName);
+const rec = await table.selectRecordAsync(recordId);
+if (!rec) throw new Error("Record not found: " + recordId);
+
+// Gate: OPT IN must be YES
+const optIn = rec.getCellValueAsString(F.optIn);
+if (optIn !== "YES") {
+  return;
+}
+
+// Validate phone
+const phoneRaw = rec.getCellValueAsString(F.phone);
+const phoneDigits = digitsOnly(phoneRaw);
+const v = validateUSPhone(phoneDigits);
+
+if (!v.ok) {
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: v.reason },
+    [F.pushStatus]: `Skipped: ${v.reason}`,
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+// Build and normalize city list from lookup
+const citiesLookup = rec.getCellValue(F.locations); // lookup -> array
+const rawCities = uniqueStrings(Array.isArray(citiesLookup) ? citiesLookup : []);
+
+const resolvedCities = [];
+const unresolved = [];
+for (const c of rawCities) {
+  const r = resolveCityToCanonical(c);
+  if (r) resolvedCities.push(r);
+  else unresolved.push(c);
+}
+
+if (unresolved.length > 0) {
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: PHONE_STATUS.VALID },
+    [F.pushStatus]: `Skipped: unknown/ambiguous cities: ${unresolved.join(", ")}`,
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+const dedupResolved = uniqueStrings(resolvedCities);
+const lastPushedJson = JSON.stringify(dedupResolved);
+
+// Store snapshot (full set as of this push)
+await table.updateRecordAsync(rec, {
+  [F.phoneStatus]: { name: PHONE_STATUS.VALID },
+  [F.lastPushedJson]: lastPushedJson
+});
+
+// Build payload
+const payload = {
+  source: "update_form",
+  competitorRecordId: rec.id,
+  name: rec.getCellValueAsString(F.fullName),
+  phoneRaw,
+  phoneDigits: v.normalized,  // 10 or 11 starting with 1
+  cities: dedupResolved       // canonical names only
+};
+
+// Send webhook
+try {
+  const resp = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const ok = resp.ok;
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: ok ? "Sent (form/phone)" : `Error: HTTP ${resp.status}`,
+    [F.pushAt]: new Date()
+  });
+} catch (e) {
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: `Error: ${e.message}`,
+    [F.pushAt]: new Date()
+  });
+  throw e;
+}
