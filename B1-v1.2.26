@@ -1,0 +1,173 @@
+/***** Automation B1: Receive Webhook → Upsert (robust, field-based) *****
+Inputs (map from the webhook trigger outputs):
+  - source (string)                e.g., "update_form" | "cities_increment"
+  - competitorRecordId (string)    Airtable record ID from Base A
+  - name (string)                  Competitor full name
+  - phoneDigits (string)           phone digits; 10 or 11 starting with 1
+  - cities (array|string)          array of canonical city strings OR a JSON string
+
+Upsert rule:
+  - Create ONLY if no row exists with (Phone Number, City, Affiliation="Competitor")
+  - If row exists, optionally refresh Name.
+
+This version:
+  - Validates all single-select options exist (City, Affiliation, Consent Source)
+  - Sends { name: "Option" } for single-select fields
+  - Gives clear errors if an option is missing
+**************************************************************************/
+
+const { source, competitorRecordId, name, phoneDigits } = input.config();
+let { cities } = input.config();
+
+const TEXT_ALERTS = base.getTable("TEXT ALERTS");
+
+// --- Field map (adjust names only if yours differ) ---
+const F = {
+  name: "Name",
+  phone: "Phone Number",
+  city: "City",                          // SINGLE SELECT
+  affiliation: "Affiliation",            // SINGLE SELECT (must include "Competitor")
+  consentSource: "Consent Source",       // SINGLE SELECT (must include "update_form","cities_increment")
+  consentTs: "Consent Timestamp",        // DATE/TIME
+  consentRecordId: "Consent Record ID"   // TEXT
+};
+
+const AFFIL_VALUE = "Competitor";
+const CONSENT_SOURCE_VALUES = ["update_form", "cities_increment"];
+
+// ---------- Utilities ----------
+function asArrayMaybe(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try {
+      const parsed = JSON.parse(v);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {}
+    // Treat as single item comma-separated or single token
+    return v.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+function uniqueStrings(arr) {
+  const seen = new Set(); const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+function validateUSPhone(raw) {
+  const s = (raw || "").replace(/\D+/g, "");
+  if (!s) return { ok: false, reason: "Invalid: empty" };
+  if (!/^\d+$/.test(s)) return { ok: false, reason: "Invalid: bad length/format" };
+  if (s.length === 10) return { ok: true, normalized: s };
+  if (s.length === 11 && s.startsWith("1")) return { ok: true, normalized: s };
+  if (s.length === 11) return { ok: false, reason: "Invalid: not US" };
+  return { ok: false, reason: "Invalid: bad length/format" };
+}
+
+// ---------- Input normalization ----------
+const vd = validateUSPhone(phoneDigits);
+if (!vd.ok) {
+  // Silently skip on invalid phone as agreed
+  return;
+}
+
+const incomingCities = uniqueStrings(asArrayMaybe(cities));
+if (incomingCities.length === 0) {
+  // Nothing to do
+  return;
+}
+
+// ---------- Field type sanity checks ----------
+function assertSingleSelect(table, fieldName) {
+  const f = table.getField(fieldName);
+  if (f.type !== "singleSelect") {
+    throw new Error(`Field "${fieldName}" must be a Single select field.`);
+  }
+  return f;
+}
+function getChoiceNames(field) {
+  return (field.options?.choices || []).map(c => c.name);
+}
+
+// Ensure single-selects have required options
+const cityField = assertSingleSelect(TEXT_ALERTS, F.city);
+const cityOptions = getChoiceNames(cityField);
+const missingCities = incomingCities.filter(c => !cityOptions.includes(c));
+if (missingCities.length > 0) {
+  throw new Error(`Add these City single-select options first: ${missingCities.join(", ")}`);
+}
+
+const affField = assertSingleSelect(TEXT_ALERTS, F.affiliation);
+const affOptions = getChoiceNames(affField);
+if (!affOptions.includes(AFFIL_VALUE)) {
+  throw new Error(`Add "${AFFIL_VALUE}" to Affiliation single-select options.`);
+}
+
+const consentField = assertSingleSelect(TEXT_ALERTS, F.consentSource);
+const consentOptions = getChoiceNames(consentField);
+if (!consentOptions.includes(source)) {
+  // If you prefer to allow only these two, enforce here:
+  if (!CONSENT_SOURCE_VALUES.includes(source)) {
+    throw new Error(`Consent Source "${source}" is not one of expected values: ${CONSENT_SOURCE_VALUES.join(", ")}`);
+  }
+  // Otherwise ask user to add missing option:
+  throw new Error(`Add "${source}" to Consent Source single-select options.`);
+}
+
+// ---------- Preload existing for upsert ----------
+const query = await TEXT_ALERTS.selectRecordsAsync({
+  fields: [F.phone, F.city, F.affiliation, F.name]
+});
+function keyFor(phone, cityName, affiliation) {
+  return `${phone.toLowerCase()}|${cityName.toLowerCase()}|${affiliation.toLowerCase()}`;
+}
+const existingMap = new Map();
+for (const r of query.records) {
+  const phoneVal = (r.getCellValue(F.phone) || "").toString();
+  const cityCell = r.getCellValue(F.city);
+  const cityName = cityCell?.name || "";
+  const affCell = r.getCellValue(F.affiliation);
+  const affName = affCell?.name || "";
+  if (!phoneVal || !cityName || !affName) continue;
+  existingMap.set(keyFor(phoneVal, cityName, affName), r);
+}
+
+// ---------- Build creates / updates ----------
+const creates = [];
+const updates = [];
+
+for (const city of incomingCities) {
+  const k = keyFor(vd.normalized, city, AFFIL_VALUE);
+  const found = existingMap.get(k);
+
+  if (!found) {
+    creates.push({
+      fields: {
+        [F.name]: name || "",
+        [F.phone]: vd.normalized,
+        [F.city]: { name: city },                 // single-select object
+        [F.affiliation]: { name: AFFIL_VALUE },   // single-select object
+        [F.consentSource]: { name: source },      // single-select object (FIXED)
+        [F.consentTs]: new Date(),                // date/time
+        [F.consentRecordId]: competitorRecordId || ""
+      }
+    });
+  } else {
+    // Optional: refresh Name if changed
+    const existingName = (found.getCellValue(F.name) || "").toString();
+    if ((name || "") && name !== existingName) {
+      updates.push({ id: found.id, fields: { [F.name]: name } });
+    }
+  }
+}
+
+// ---------- Batch writes ----------
+for (let i = 0; i < creates.length; i += 50) {
+  await TEXT_ALERTS.createRecordsAsync(creates.slice(i, i + 50));
+}
+for (let i = 0; i < updates.length; i += 50) {
+  await TEXT_ALERTS.updateRecordsAsync(updates.slice(i, i + 50));
+}
