@@ -1,0 +1,178 @@
+/***** Automation B1: Receive Webhook → Upsert (Base B: 2026 Regionals) *****
+Inputs required (Automation → “Run script” → Input variables):
+  - payloadRaw (string) : map to the Webhook trigger "Body" (raw JSON)
+
+Behavior:
+  - Validates phoneDigits (10 digits OR 11 digits starting with '1')
+  - For each city in payload.cities:
+      If no existing TEXT ALERTS row where (Phone Number, City, Affiliation="Competitor"),
+      create one with Name, Phone Number, City, Affiliation, Consent Source, Consent Timestamp,
+      Consent Record ID.
+      If exists, optionally refresh Name.
+******************************************************************************/
+
+const { payloadRaw } = input.config();
+const TEXT_ALERTS = base.getTable("TEXT ALERTS");
+
+// Optional debug log (if present)
+let ingressLog = null;
+try { ingressLog = base.getTable("Ingress Log"); } catch { /* ignore */ }
+
+// ---- Field names (exact) ----
+const F = {
+  name: "Name",
+  phone: "Phone Number",
+  city: "City",                          // single select
+  affiliation: "Affiliation",            // single select (include "Competitor")
+  consentSource: "Consent Source",       // single select: update_form, cities_increment
+  consentTs: "Consent Timestamp",        // date/time
+  consentRecordId: "Consent Record ID"   // single line text
+};
+
+const AFFIL_VALUE = "Competitor";
+
+function logRow(payload, processed, errorMsg) {
+  if (!ingressLog) return;
+  const when = new Date().toISOString();
+  return ingressLog.createRecordAsync({
+    "Raw Payload": typeof payload === "string" ? payload : JSON.stringify(payload),
+    "Processed?": processed ? "true" : "false",
+    "Error": errorMsg || "",
+    "When": when
+  }).catch(()=>{});
+}
+
+function digitsOnly(s) { return (s || "").replace(/\D+/g, ""); }
+function validateUSPhone(d) {
+  if (!d) return { ok: false, reason: "Invalid: empty" };
+  if (!/^\d+$/.test(d)) return { ok: false, reason: "Invalid: bad length/format" };
+  if (d.length === 10) return { ok: true, normalized: d };
+  if (d.length === 11 && d.startsWith("1")) return { ok: true, normalized: d };
+  if (d.length === 11 && !d.startsWith("1")) return { ok: false, reason: "Invalid: not US" };
+  return { ok: false, reason: "Invalid: bad length/format" };
+}
+
+function uniqueStrings(arr) {
+  const seen = new Set(); const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+// ---- Parse payload ----
+let payload = null;
+try {
+  payload = JSON.parse(payloadRaw || "{}");
+} catch (e) {
+  await logRow(payloadRaw, false, "JSON parse error");
+  throw new Error("Payload JSON parse error");
+}
+
+const { source, competitorRecordId, name, phoneDigits, cities } = payload || {};
+const vd = validateUSPhone(phoneDigits);
+
+if (!vd.ok) {
+  await logRow(payload, false, "Invalid phone: " + (vd.reason || "unknown"));
+  // skip silently, do not create
+  return;
+}
+
+const citiesList = uniqueStrings(Array.isArray(cities) ? cities : []);
+if (citiesList.length === 0) {
+  await logRow(payload, true, "No cities to process");
+  return;
+}
+
+// ---- Preload existing TEXT ALERTS data for matching ----
+const query = await TEXT_ALERTS.selectRecordsAsync({
+  fields: [F.phone, F.city, F.affiliation, F.name]
+});
+
+// Build a lookup: key = phone|city|affiliation (lowercased)
+function keyFor(phone, cityName, affiliation) {
+  return `${phone.toLowerCase()}|${cityName.toLowerCase()}|${affiliation.toLowerCase()}`;
+}
+
+const existingMap = new Map();
+for (const r of query.records) {
+  const phoneVal = (r.getCellValue(F.phone) || "").toString();
+  const cityCell = r.getCellValue(F.city); // single select -> {name}
+  const cityName = cityCell && cityCell.name ? cityCell.name : "";
+  const affiliationCell = r.getCellValue(F.affiliation);
+  const affiliationName = affiliationCell && affiliationCell.name ? affiliationCell.name : "";
+  if (!phoneVal || !cityName || !affiliationName) continue;
+  existingMap.set(keyFor(phoneVal, cityName, affiliationName), r);
+}
+
+// ---- Ensure single-select options contain incoming cities ----
+const cityField = TEXT_ALERTS.getField(F.city);
+const cityOptions = cityField.options?.choices?.map(c => c.name) || [];
+function hasCityOption(name){ return cityOptions.includes(name); }
+
+// If any city is missing from the single-select option list, throw a clear error
+const missing = citiesList.filter(c => !hasCityOption(c));
+if (missing.length > 0) {
+  await logRow(payload, false, "Missing City options: " + missing.join(", "));
+  throw new Error("Add these City single-select options first: " + missing.join(", "));
+}
+
+// Affiliation must include "Competitor"
+const affiliationField = TEXT_ALERTS.getField(F.affiliation);
+const affChoices = affiliationField.options?.choices?.map(c => c.name) || [];
+if (!affChoices.includes(AFFIL_VALUE)) {
+  await logRow(payload, false, `Affiliation option missing: ${AFFIL_VALUE}`);
+  throw new Error(`Add "${AFFIL_VALUE}" to Affiliation single-select options.`);
+}
+
+// ---- Upsert per city ----
+const creates = [];
+const updates = [];
+
+for (const city of citiesList) {
+  const k = keyFor(vd.normalized, city, AFFIL_VALUE);
+  const found = existingMap.get(k);
+
+  if (!found) {
+    // CREATE
+    creates.push({
+      fields: {
+        [F.name]: name || "",
+        [F.phone]: vd.normalized,
+        [F.city]: { name: city },
+        [F.affiliation]: { name: AFFIL_VALUE },
+        [F.consentSource]: source || "",
+        [F.consentTs]: new Date(),
+        [F.consentRecordId]: competitorRecordId || ""
+      }
+    });
+  } else {
+    // UPDATE (optional: refresh Name if changed)
+    const existingName = (found.getCellValue(F.name) || "").toString();
+    if ((name || "") && name !== existingName) {
+      updates.push({
+        id: found.id,
+        fields: { [F.name]: name }
+      });
+    }
+  }
+}
+
+// Batch create/update (Airtable limits: 50 per call)
+async function batchCreate(tbl, records) {
+  for (let i = 0; i < records.length; i += 50) {
+    await tbl.createRecordsAsync(records.slice(i, i + 50));
+  }
+}
+async function batchUpdate(tbl, records) {
+  for (let i = 0; i < records.length; i += 50) {
+    await tbl.updateRecordsAsync(records.slice(i, i + 50));
+  }
+}
+
+if (creates.length > 0) await batchCreate(TEXT_ALERTS, creates);
+if (updates.length > 0) await batchUpdate(TEXT_ALERTS, updates);
+
+await logRow(payload, true, `Created: ${creates.length}, Updated: ${updates.length}`);
