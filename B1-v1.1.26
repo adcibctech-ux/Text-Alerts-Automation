@@ -1,0 +1,131 @@
+/***** Automation B1: Receive Webhook → Upsert (field-based) *****
+Inputs (map from the webhook trigger outputs):
+  - source (string)
+  - competitorRecordId (string)
+  - name (string)
+  - phoneDigits (string)
+  - cities (array of strings)
+
+Behavior:
+  - Validates phoneDigits (10 digits OR 11 digits starting with '1')
+  - For each city in `cities`, requires exact single-select option
+  - Upsert into TEXT ALERTS by (Phone Number, City, Affiliation="Competitor")
+******************************************************************/
+
+const { source, competitorRecordId, name, phoneDigits, cities } = input.config();
+const TEXT_ALERTS = base.getTable("TEXT ALERTS");
+
+// ---- Field names (exact) ----
+const F = {
+  name: "Name",
+  phone: "Phone Number",
+  city: "City",                          // single select
+  affiliation: "Affiliation",            // single select (include "Competitor")
+  consentSource: "Consent Source",       // single select: update_form, cities_increment
+  consentTs: "Consent Timestamp",        // date/time
+  consentRecordId: "Consent Record ID"   // single line text
+};
+
+const AFFIL_VALUE = "Competitor";
+
+function validateUSPhone(d) {
+  const s = (d || "").replace(/\D+/g, "");
+  if (!s) return { ok: false, reason: "Invalid: empty" };
+  if (!/^\d+$/.test(s)) return { ok: false, reason: "Invalid: bad length/format" };
+  if (s.length === 10) return { ok: true, normalized: s };
+  if (s.length === 11 && s.startsWith("1")) return { ok: true, normalized: s };
+  if (s.length === 11 && !s.startsWith("1")) return { ok: false, reason: "Invalid: not US" };
+  return { ok: false, reason: "Invalid: bad length/format" };
+}
+
+function uniqueStrings(arr) {
+  const seen = new Set(); const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+const vd = validateUSPhone(phoneDigits);
+if (!vd.ok) {
+  // Skip silently on invalid phone
+  return;
+}
+
+const incomingCities = uniqueStrings(Array.isArray(cities) ? cities : []);
+if (incomingCities.length === 0) {
+  return;
+}
+
+// Ensure City single-select has exact options for all incoming cities
+const cityField = TEXT_ALERTS.getField(F.city);
+const cityChoices = (cityField.options?.choices || []).map(c => c.name);
+const missing = incomingCities.filter(c => !cityChoices.includes(c));
+if (missing.length > 0) {
+  throw new Error("Add these City single-select options first: " + missing.join(", "));
+}
+
+// Ensure Affiliation has "Competitor"
+const affField = TEXT_ALERTS.getField(F.affiliation);
+const affChoices = (affField.options?.choices || []).map(c => c.name);
+if (!affChoices.includes(AFFIL_VALUE)) {
+  throw new Error(`Add "${AFFIL_VALUE}" to Affiliation single-select options.`);
+}
+
+// Preload existing rows to upsert by (phone|city|affiliation)
+const query = await TEXT_ALERTS.selectRecordsAsync({
+  fields: [F.phone, F.city, F.affiliation, F.name]
+});
+
+function keyFor(phone, cityName, affiliation) {
+  return `${phone.toLowerCase()}|${cityName.toLowerCase()}|${affiliation.toLowerCase()}`;
+}
+
+const existingMap = new Map();
+for (const r of query.records) {
+  const phoneVal = (r.getCellValue(F.phone) || "").toString();
+  const cityCell = r.getCellValue(F.city); // {name}
+  const cityName = cityCell?.name || "";
+  const affCell = r.getCellValue(F.affiliation);
+  const affName = affCell?.name || "";
+  if (!phoneVal || !cityName || !affName) continue;
+  existingMap.set(keyFor(phoneVal, cityName, affName), r);
+}
+
+const creates = [];
+const updates = [];
+
+for (const city of incomingCities) {
+  const k = keyFor(vd.normalized, city, AFFIL_VALUE);
+  const found = existingMap.get(k);
+
+  if (!found) {
+    creates.push({
+      fields: {
+        [F.name]: name || "",
+        [F.phone]: vd.normalized,
+        [F.city]: { name: city },
+        [F.affiliation]: { name: AFFIL_VALUE },
+        [F.consentSource]: source || "",
+        [F.consentTs]: new Date(),
+        [F.consentRecordId]: competitorRecordId || ""
+      }
+    });
+  } else {
+    // optional: refresh name
+    const existingName = (found.getCellValue(F.name) || "").toString();
+    if ((name || "") && name !== existingName) {
+      updates.push({ id: found.id, fields: { [F.name]: name } });
+    }
+  }
+}
+
+// Batch create/update in chunks of 50
+for (let i = 0; i < creates.length; i += 50) {
+  await TEXT_ALERTS.createRecordsAsync(creates.slice(i, i + 50));
+}
+for (let i = 0; i < updates.length; i += 50) {
+  await TEXT_ALERTS.updateRecordsAsync(updates.slice(i, i + 50));
+}
