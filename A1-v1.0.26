@@ -1,0 +1,121 @@
+/***** Automation A1: Phone/Opt-in → Webhook (Base A: ADCIBC 2026) *****
+Inputs required (Automation → “Run script” → Input variables):
+  - recordId   (string) : trigger record ID from "When record updated"
+  - webhookUrl (string) : webhook URL from Base B automation
+***********************************************************************/
+
+const { recordId, webhookUrl } = input.config();
+const tableName = "Competitor Profiles";
+
+// ---- Field names (exact) ----
+const F = {
+  fullName: "Full Name",
+  phone: "Competitor Phone Number",
+  optIn: "Text Alerts OPT IN",
+  locations: "Regionals Locations",              // lookup → array of city names
+  lastPushedJson: "Last Pushed Cities (JSON)",   // long text
+  phoneStatus: "Phone Validation Status",        // single select
+  pushStatus: "Last Text Alerts Push Status",    // single line text
+  pushAt: "Last Text Alerts Push At"             // date/time
+};
+
+// ---- Helpers ----
+const PHONE_STATUS = {
+  VALID: "Valid (+1 US)",
+  EMPTY: "Invalid: empty",
+  NOT_US: "Invalid: not US",
+  BAD_LEN: "Invalid: bad length/format",
+};
+
+function digitsOnly(s) { return (s || "").replace(/\D+/g, ""); }
+
+function validateUSPhone(d) {
+  if (!d) return { ok: false, reason: PHONE_STATUS.EMPTY };
+  if (!/^\d+$/.test(d)) return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+  if (d.length === 10) return { ok: true, normalized: d };
+  if (d.length === 11 && d.startsWith("1")) return { ok: true, normalized: d };
+  if (d.length === 11 && !d.startsWith("1")) return { ok: false, reason: PHONE_STATUS.NOT_US };
+  return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+}
+
+function uniqueStrings(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+// ---- Main ----
+const table = base.getTable(tableName);
+const rec = await table.selectRecordAsync(recordId);
+if (!rec) throw new Error("Record not found: " + recordId);
+
+// Gate: OPT IN must be YES
+const optIn = rec.getCellValueAsString(F.optIn);
+if (optIn !== "YES") {
+  // nothing to do
+  return;
+}
+
+// Validate phone
+const phoneRaw = rec.getCellValueAsString(F.phone);
+const phoneDigits = digitsOnly(phoneRaw);
+const v = validateUSPhone(phoneDigits);
+
+if (!v.ok) {
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: v.reason },
+    [F.pushStatus]: `Skipped: ${v.reason}`,
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+// Valid phone
+await table.updateRecordAsync(rec, {
+  [F.phoneStatus]: { name: PHONE_STATUS.VALID }
+});
+
+// Build city list from lookup
+const citiesLookup = rec.getCellValue(F.locations); // array of strings (lookup)
+const cities = uniqueStrings(Array.isArray(citiesLookup) ? citiesLookup : []);
+const lastPushedJson = JSON.stringify(cities);
+
+// Store snapshot (full set as of this push)
+await table.updateRecordAsync(rec, {
+  [F.lastPushedJson]: lastPushedJson
+});
+
+// Build payload
+const payload = {
+  source: "update_form",
+  competitorRecordId: rec.id,
+  name: rec.getCellValueAsString(F.fullName),
+  phoneRaw,
+  phoneDigits: v.normalized,  // 10 digits or 11 starting with 1
+  cities
+};
+
+// Send webhook
+try {
+  const resp = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const ok = resp.ok;
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: ok ? "Sent (form/phone)" : `Error: HTTP ${resp.status}`,
+    [F.pushAt]: new Date()
+  });
+} catch (e) {
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: `Error: ${e.message}`,
+    [F.pushAt]: new Date()
+  });
+  throw e;
+}
