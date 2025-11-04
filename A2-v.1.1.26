@@ -1,0 +1,190 @@
+/***** Automation A2: New Cities → Webhook (Base A: ADCIBC 2026) *****
+Inputs required (Automation → “Run script” → Input variables):
+  - recordId   (string) : trigger record ID from "When record updated"
+  - webhookUrl (string) : webhook URL from Base B automation
+*********************************************************************/
+
+const { recordId, webhookUrl } = input.config();
+const tableName = "Competitor Profiles";
+
+// ---- Field names (exact) ----
+const F = {
+  fullName: "Full Name",
+  phone: "Competitor Phone Number",
+  optIn: "Text Alerts OPT IN",
+  locations: "Regionals Locations",              // lookup → array of city names
+  lastPushedJson: "Last Pushed Cities (JSON)",   // long text
+  phoneStatus: "Phone Validation Status",        // single select
+  pushStatus: "Last Text Alerts Push Status",    // single line text
+  pushAt: "Last Text Alerts Push At"             // date/time
+};
+
+// ---- Canonical city list (must match TEXT ALERTS {City} options exactly) ----
+const CANONICAL_CITIES = [
+  "San Francisco, CA",
+  "Seattle, WA",
+  "Berlin [Germany]",
+  "Chicago, IL",
+  "Phoenix, AZ",
+  "Atlanta, GA",
+  "Toronto, ON [Canada]",
+  "Los Angeles, CA",
+  "San Diego, CA",
+  "Houston, TX",
+  "Pittsburgh, PA",
+  "Raleigh, NC",
+  "Dallas, TX",
+  "Denver, CO",
+  "Orlando, FL"
+];
+
+const CANON_SET = new Set(CANONICAL_CITIES);
+const CANON_LOWER_MAP = new Map(CANONICAL_CITIES.map(c => [c.toLowerCase(), c]));
+
+function resolveCityToCanonical(incoming) {
+  if (!incoming) return null;
+  const incTrim = incoming.trim();
+  if (!incTrim) return null;
+
+  if (CANON_SET.has(incTrim)) return incTrim;
+
+  const incLower = incTrim.toLowerCase();
+  if (CANON_LOWER_MAP.has(incLower)) return CANON_LOWER_MAP.get(incLower);
+
+  const prefixMatches = CANONICAL_CITIES.filter(c => c.toLowerCase().startsWith(incLower + ","));
+  if (prefixMatches.length === 1) return prefixMatches[0];
+
+  const leftMatches = CANONICAL_CITIES.filter(c => {
+    const left = c.split(",")[0].trim().toLowerCase();
+    return left === incLower;
+  });
+  if (leftMatches.length === 1) return leftMatches[0];
+
+  return null;
+}
+
+const PHONE_STATUS = {
+  VALID: "Valid (+1 US)",
+  EMPTY: "Invalid: empty",
+  NOT_US: "Invalid: not US",
+  BAD_LEN: "Invalid: bad length/format",
+};
+
+function digitsOnly(s) { return (s || "").replace(/\D+/g, ""); }
+function validateUSPhone(d) {
+  if (!d) return { ok: false, reason: PHONE_STATUS.EMPTY };
+  if (!/^\d+$/.test(d)) return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+  if (d.length === 10) return { ok: true, normalized: d };
+  if (d.length === 11 && d.startsWith("1")) return { ok: true, normalized: d };
+  if (d.length === 11 && !d.startsWith("1")) return { ok: false, reason: PHONE_STATUS.NOT_US };
+  return { ok: false, reason: PHONE_STATUS.BAD_LEN };
+}
+function uniqueStrings(arr) {
+  const seen = new Set(); const out = [];
+  for (const v of (arr || [])) {
+    const t = (v || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+function parseJsonArray(s) {
+  try {
+    const v = JSON.parse(s || "[]");
+    return Array.isArray(v) ? v.map(x => String(x)) : [];
+  } catch { return []; }
+}
+
+// ---- Main ----
+const table = base.getTable(tableName);
+const rec = await table.selectRecordAsync(recordId);
+if (!rec) throw new Error("Record not found: " + recordId);
+
+// Gate: OPT IN must be YES
+const optIn = rec.getCellValueAsString(F.optIn);
+if (optIn !== "YES") {
+  return;
+}
+
+// Validate phone
+const phoneRaw = rec.getCellValueAsString(F.phone);
+const phoneDigits = digitsOnly(phoneRaw);
+const v = validateUSPhone(phoneDigits);
+
+if (!v.ok) {
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: v.reason },
+    [F.pushStatus]: `Skipped: ${v.reason}`,
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+// Current & last pushed city sets
+const currentRaw = uniqueStrings(rec.getCellValue(F.locations) || []);
+const currentResolved = [];
+const unresolved = [];
+for (const c of currentRaw) {
+  const r = resolveCityToCanonical(c);
+  if (r) currentResolved.push(r);
+  else unresolved.push(c);
+}
+
+if (unresolved.length > 0) {
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: PHONE_STATUS.VALID },
+    [F.pushStatus]: `Skipped: unknown/ambiguous cities: ${unresolved.join(", ")}`,
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+const currentCities = uniqueStrings(currentResolved);
+
+const lastPushed = parseJsonArray(rec.getCellValueAsString(F.lastPushedJson));
+const lastSet = new Set(lastPushed);
+
+// Compute new cities
+const newCities = currentCities.filter(c => !lastSet.has(c));
+
+if (newCities.length === 0) {
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: "No new cities",
+    [F.pushAt]: new Date()
+  });
+  return;
+}
+
+// Send webhook with only the new cities
+const payload = {
+  source: "cities_increment",
+  competitorRecordId: rec.id,
+  name: rec.getCellValueAsString(F.fullName),
+  phoneRaw,
+  phoneDigits: v.normalized,
+  cities: newCities
+};
+
+try {
+  const resp = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const ok = resp.ok;
+
+  // Update last pushed snapshot to FULL current canonical list
+  await table.updateRecordAsync(rec, {
+    [F.phoneStatus]: { name: PHONE_STATUS.VALID },
+    [F.lastPushedJson]: JSON.stringify(currentCities),
+    [F.pushStatus]: ok ? "Sent (increment)" : `Error: HTTP ${resp.status}`,
+    [F.pushAt]: new Date()
+  });
+
+} catch (e) {
+  await table.updateRecordAsync(rec, {
+    [F.pushStatus]: `Error: ${e.message}`,
+    [F.pushAt]: new Date()
+  });
+  throw e;
+}
